@@ -1,0 +1,315 @@
+# bump: paramiko-version /PARAMIKO_VERSION="(.*)"/ https://github.com/paramiko/paramiko.git|semver:*
+PARAMIKO_VERSION="5.0.0"
+
+###
+### Build control file for the paramiko port
+###
+### paramiko implements SSHv2 in pure Python: clients, servers, SFTP and key
+### handling. It is what most Python tooling reaches for to drive SSH.
+###
+### No C code of its own -- everything platform specific lives in its
+### dependencies, which is why this port exists only now: cryptography, bcrypt
+### and pynacl all had to land first.
+###
+### Note the tag: releases through 4.x are tagged with a leading "v", but 5.0.0
+### is tagged bare.
+###
+
+export ZOPEN_PROJECT_NAME="paramiko"
+export ZOPEN_BUILD_LINE="STABLE"
+export ZOPEN_CATEGORIES="development security library networking"
+
+export ZOPEN_STABLE_URL="https://github.com/paramiko/paramiko.git"
+export ZOPEN_STABLE_TAG="${PARAMIKO_VERSION}"
+export ZOPEN_DEV_URL="https://github.com/paramiko/paramiko.git"
+
+export ZOPEN_STABLE_DEPS="check_python cryptography bcrypt pynacl"
+export ZOPEN_DEV_DEPS="check_python cryptography bcrypt pynacl"
+export ZOPEN_RUNTIME_DEPS="check_python cryptography bcrypt pynacl"
+
+export ZOPEN_BUILD_SYSTEM="Python"
+
+# paramiko itself needs only setuptools to build, but its dependencies do not
+# resolve in an isolated venv: pynacl requires cffi, which on z/OS exists solely
+# as the copy shipped with each interpreter, so pip would try to build the sdist
+# and fail with "thread-local storage is not supported for the current target".
+# The check phase installs those dependencies, so it needs to see them.
+export ZOPEN_PYTHON_VENV_SYSTEM_SITE="true"
+
+zopen_get_version() {
+  echo "${PARAMIKO_VERSION}"
+}
+
+zopen_python_test() {
+  PARAMIKO_EXPECTED_VERSION="${PARAMIKO_VERSION}" python - <<'PYEOF'
+import io
+import os
+import socket
+import sys
+import sysconfig
+import threading
+import traceback
+
+# Exercise the installed wheel, not the checkout: paramiko keeps its package at
+# the repository root, so the build directory would otherwise shadow it and the
+# tests would pass against source that was never packaged.
+#
+# realpath on both sides: /tmp is a symlink to /$SYSNAME/tmp here, so a path
+# spelled /tmp/... and a working directory of /S0W1/tmp/... are the same place
+# while abspath compares them as different.
+_here = os.path.realpath(os.getcwd())
+sys.path = [p for p in sys.path
+            if p not in ("", ".") and os.path.realpath(p) != _here]
+
+failures = 0
+total = 0
+
+
+def check(label, fn):
+    global failures, total
+    total += 1
+    try:
+        if fn():
+            print("PASS:", label)
+        else:
+            print("FAIL:", label, file=sys.stderr)
+            failures += 1
+    except Exception as exc:
+        print("FAIL:", label, "-", exc, file=sys.stderr)
+        failures += 1
+
+
+try:
+    import paramiko
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
+except ImportError as exc:
+    print("FAIL: import paramiko -", exc, file=sys.stderr)
+    print("paramiko FAILED to import on Python %s" % sys.version.split()[0])
+    sys.exit(1)
+
+import importlib.metadata
+
+check("imported from the installed wheel, not the source tree",
+      lambda: os.path.realpath(paramiko.__file__).startswith(
+          os.path.realpath(sysconfig.get_paths()["purelib"])))
+
+check("version is the one this port builds",
+      lambda: importlib.metadata.version("paramiko")
+      == os.environ["PARAMIKO_EXPECTED_VERSION"])
+
+# An Ed25519 key is the reason this port waited on pynacl: paramiko routes
+# Ed25519 through PyNaCl, and PyNaCl through libsodium. A handshake using one
+# exercises that whole stack rather than just importing it.
+_raw = ed25519.Ed25519PrivateKey.generate()
+_pem = _raw.private_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PrivateFormat.OpenSSH,
+    encryption_algorithm=serialization.NoEncryption(),
+).decode()
+host_key = paramiko.Ed25519Key.from_private_key(io.StringIO(_pem))
+
+check("an Ed25519 key loads through paramiko",
+      lambda: host_key.get_name() == "ssh-ed25519")
+
+
+def ed25519_sign_verify():
+    # Verify with a public-only key, the way a peer would. An Ed25519Key built
+    # from a private key leaves _verifying_key unset and verify_ssh_sig reads
+    # that attribute directly, so verifying against the signer itself raises
+    # AttributeError on None rather than returning a result.
+    pub = paramiko.Ed25519Key(data=host_key.asbytes())
+    # sign_ssh_data returns a Message positioned at the end, so it has to be
+    # rewound before the signature can be read back out.
+    sig = host_key.sign_ssh_data(b"payload")
+    sig.rewind()
+    if not pub.verify_ssh_sig(b"payload", sig):
+        return False
+    other = host_key.sign_ssh_data(b"payload")
+    other.rewind()
+    return not pub.verify_ssh_sig(b"different payload", other)
+
+
+check("Ed25519 signs, verifies, and rejects a mismatch", ed25519_sign_verify)
+
+
+def rsa_key_round_trip():
+    # RSA goes through cryptography rather than PyNaCl, so this covers the
+    # other half of the key handling.
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    loaded = paramiko.RSAKey.from_private_key(io.StringIO(pem))
+
+    # The algorithm has to be named. get_name() still reports "ssh-rsa", but
+    # paramiko 5 dropped SHA-1 RSA, and signing without an explicit algorithm
+    # looks that name up and raises KeyError: 'ssh-rsa' -- which reads as a
+    # missing key type rather than a deliberately retired signature scheme.
+    sig = loaded.sign_ssh_data(b"payload", algorithm="rsa-sha2-256")
+    sig.rewind()
+    pub = paramiko.RSAKey(data=loaded.asbytes())
+    if not pub.verify_ssh_sig(b"payload", sig):
+        return False
+    other = loaded.sign_ssh_data(b"payload", algorithm="rsa-sha2-512")
+    other.rewind()
+    return pub.verify_ssh_sig(b"payload", other)
+
+
+check("an RSA key loads, signs and verifies", rsa_key_round_trip)
+
+
+class _Server(paramiko.ServerInterface):
+    def check_auth_password(self, username, password):
+        if username == "zopen" and password == "s3cret":
+            return paramiko.AUTH_SUCCESSFUL
+        return paramiko.AUTH_FAILED
+
+    def get_allowed_auths(self, username):
+        return "password"
+
+    def check_channel_request(self, kind, chanid):
+        if kind == "session":
+            return paramiko.OPEN_SUCCEEDED
+        return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+
+
+def _run_server(sock, state, release):
+    """Serve one connection, holding the transport open until released.
+
+    The transport has to stay referenced for the whole exchange. Let this
+    return while the client is still working and the Transport is collected,
+    closing the connection underneath it -- the client then fails at
+    open_session with a bare "Unable to open channel", which reads as the
+    server refusing the request rather than having gone away.
+    """
+    try:
+        conn, _ = sock.accept()
+        transport = paramiko.Transport(conn)
+        state["transport"] = transport
+        transport.add_server_key(host_key)
+        transport.start_server(server=_Server())
+        chan = transport.accept(20)
+        if chan is not None:
+            chan.send(b"hello from paramiko on z/OS")
+            chan.shutdown_write()
+            state["served"] = True
+        release.wait(30)
+        transport.close()
+    except Exception:
+        state["error"] = traceback.format_exc()
+
+
+# A real SSHv2 exchange over a loopback socket: key exchange, host key
+# verification, authentication and an encrypted channel. Importing paramiko
+# proves nothing about whether its crypto actually works here.
+lsock = socket.socket()
+lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+lsock.bind(("127.0.0.1", 0))
+lsock.listen(1)
+_port = lsock.getsockname()[1]
+
+state = {}
+release = threading.Event()
+th = threading.Thread(target=_run_server, args=(lsock, state, release),
+                      daemon=True)
+th.start()
+
+csock = socket.create_connection(("127.0.0.1", _port), timeout=30)
+ct = paramiko.Transport(csock)
+ct.start_client(timeout=30)
+
+check("client negotiates an ed25519 host key",
+      lambda: ct.get_remote_server_key().get_name() == "ssh-ed25519")
+check("the host key presented is the server's",
+      lambda: ct.get_remote_server_key().asbytes() == host_key.asbytes())
+
+ct.auth_password("zopen", "s3cret")
+check("password authentication succeeds", lambda: ct.is_authenticated())
+check("a cipher was negotiated", lambda: bool(ct.local_cipher))
+
+chan = ct.open_session(timeout=30)
+_payload = chan.recv(1024)
+check("data crosses the encrypted channel",
+      lambda: _payload == b"hello from paramiko on z/OS")
+
+chan.close()
+release.set()
+th.join(timeout=30)
+ct.close()
+csock.close()
+lsock.close()
+
+check("the server side completed without error",
+      lambda: state.get("served") is True and "error" not in state)
+if "error" in state:
+    print(state["error"], file=sys.stderr)
+
+
+def bad_password_rejected():
+    s2 = socket.socket()
+    s2.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s2.bind(("127.0.0.1", 0))
+    s2.listen(1)
+    p2 = s2.getsockname()[1]
+    st2 = {}
+    rel2 = threading.Event()
+    t2 = threading.Thread(target=_run_server, args=(s2, st2, rel2), daemon=True)
+    t2.start()
+    cs = socket.create_connection(("127.0.0.1", p2), timeout=30)
+    tr = paramiko.Transport(cs)
+    tr.start_client(timeout=30)
+    try:
+        tr.auth_password("zopen", "wrong")
+        return False
+    except paramiko.AuthenticationException:
+        return True
+    finally:
+        rel2.set()
+        tr.close()
+        cs.close()
+        t2.join(timeout=10)
+        s2.close()
+
+
+check("a wrong password is rejected", bad_password_rejected)
+
+print()
+print("paramiko %s on Python %s  --  %d passed, %d failed" % (
+    importlib.metadata.version("paramiko"),
+    sys.version.split()[0], total - failures, failures))
+sys.exit(1 if failures else 0)
+PYEOF
+}
+
+zopen_check_results() {
+  dir="$1"; pfx="$2"; chk="${dir}/${pfx}_check.log"
+  # No "|| echo 0": grep -c prints 0 when nothing matches and also exits 1, so
+  # the fallback appends a second zero and the arithmetic dies with FSUM9224.
+  passed=$(grep -c "^PASS:" "${chk}" 2>/dev/null)
+  failed=$(grep -c "^FAIL:" "${chk}" 2>/dev/null)
+  passed=${passed:-0}
+  failed=${failed:-0}
+  total=$((passed + failed))
+
+  # An interpreter whose test script dies before the first check contributes no
+  # PASS and no FAIL, so counting those alone would score a crash as a clean run.
+  interpreters=$(grep -c "^paramiko .* on Python" "${chk}" 2>/dev/null)
+  interpreters=${interpreters:-0}
+  expected=$(echo "${ZOPEN_PYTHON_VERSIONS:-3.12 3.13 3.14}" | wc -w | tr -d ' ')
+  if [ "${interpreters}" -lt "${expected}" ]; then
+    silent=$((expected - interpreters))
+    failed=$((failed + silent))
+    total=$((total + silent))
+  fi
+
+  echo "actualFailures:${failed}"
+  echo "totalTests:${total}"
+  echo "expectedFailures:0"
+}
+
+zopen_append_to_validate_install() {
+  echo "python3 -c \"import paramiko, importlib.metadata; print('paramiko', importlib.metadata.version('paramiko'))\""
+}
