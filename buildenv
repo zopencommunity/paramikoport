@@ -1,5 +1,5 @@
 # bump: paramiko-version /PARAMIKO_VERSION="(.*)"/ https://github.com/paramiko/paramiko.git|semver:*
-PARAMIKO_VERSION="5.0.0"
+PARAMIKO_VERSION="5.1.0"
 
 ###
 ### Build control file for the paramiko port
